@@ -935,6 +935,8 @@ const P0=document.documentElement.dataset.phosphor;setPhos(['green','color'].inc
 for(const [b,p] of [['condtg','condbody'],['howtg','howbody']])$('#'+b).onclick=function(){const o=this.getAttribute('aria-expanded')==='true';this.setAttribute('aria-expanded',String(!o));$('#'+p).hidden=o;this.closest('fieldset').classList.toggle('shut',o)};
 {const d=document.documentElement;if(d.classList.contains('bt')){const end=()=>{d.classList.remove('bt');removeEventListener('pointerdown',end);removeEventListener('keydown',end)};addEventListener('pointerdown',end);addEventListener('keydown',end);setTimeout(end,2300)}}
 render();
+// GoatCounter visit count: one image request to goatcounter.com, on the live domain only (no third-party script)
+if(location.hostname==='dyno.turboloser.co'&&!navigator.webdriver)try{new Image().src='https://dyno.goatcounter.com/count?p='+encodeURIComponent(location.pathname)+'&t='+encodeURIComponent(document.title)+'&r='+encodeURIComponent(document.referrer)+'&s='+screen.width+'&rnd='+Math.random().toString(36).slice(2)}catch{/* no count */}
 // Installable and usable with no signal: sw.js keeps a copy of the page. Service workers need http(s), so a file:// copy skips this.
 if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol))addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
 </script></body></html>
