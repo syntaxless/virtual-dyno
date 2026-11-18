@@ -538,9 +538,10 @@ def synth_coast(crr=0.0105, grade=0.0, wind=0.0, cda_scale=1.0, v_lift=100, v_st
     return "\n".join([",".join(hdr)] + rows), times, speeds
 
 
-def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10):
+def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10, relalt_grade=None):
     """A GPX of the same drive, due east at 39.74 N, elevation 1,600 m + grade x distance, speed in m/s, starting `lead` s before the log
-    at 2026-10-01 18:00 UTC. Exact: no GPS noise."""
+    at 2026-10-01 18:00 UTC. Exact: no GPS noise. relalt_grade adds the Dyno Logger app's barometric altitude (<dl:relalt>, metres since
+    the start) on that grade, which the page should prefer over <ele> for road grade."""
     import datetime
     base = datetime.datetime(2026, 10, 1, 18, 0, 0)
     T = [-lead] + times + [times[-1] + 4.0]
@@ -565,7 +566,9 @@ def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10):
         d, vv = at(x, D), at(x, V)
         ts = (base + datetime.timedelta(seconds=x + lead)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         pts.append(f'<trkpt lat="39.7400000" lon="{-104.98 + d / (111320 * math.cos(math.radians(39.74))):.7f}"><ele>{1600 + grade * d:.2f}</ele>'
-                   f'<time>{ts}</time><speed>{vv:.3f}</speed></trkpt>')
+                   f'<time>{ts}</time><speed>{vv:.3f}</speed>'
+                   + (f'<dl:relalt>{relalt_grade * d:.2f}</dl:relalt><dl:pressure>{1013 - relalt_grade * d * .12:.2f}</dl:pressure>' if relalt_grade is not None else "")
+                   + '</trkpt>')
         x += 1.0 / hz
     return '<?xml version="1.0"?><gpx version="1.1" creator="synthetic"><trk><trkseg>' + "".join(pts) + "</trkseg></trk></gpx>"
 
@@ -697,8 +700,8 @@ async def field_tags(browser):
     await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
     await pg.wait_for_timeout(1500)
     tg = await tags()
-    check("heading and grade from the GPS track are tagged gps, density altitude too (its pressure is the GPS altitude)",
-          tg["head"] == "gps" and tg["grade"] == "gps" and tg["da"] == "gps", str(tg))
+    check("heading and grade from the GPS track are tagged gps, and the weather fetched on its own fills humidity, wind and density altitude",
+          tg["head"] == "gps" and tg["grade"] == "gps" and tg["da"] == "weather" and tg["humid"] == "weather" and tg["wind"] == "weather", str(tg))
     check("the coast fit is tagged coast", tg["crr"] in ("coast", ""), str(tg))
     await pg.click("#wxget")
     await pg.wait_for_timeout(900)
@@ -717,10 +720,254 @@ async def field_tags(browser):
     await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": synth_coast(mode="none")[0].encode()})
     await pg.wait_for_timeout(600)
     tg = await tags()
-    check("a new log clears the tags that came from the old data and keeps the typed ones",
-          tg["temp"] == "" and tg["humid"] == "typed" and tg["curb"] == "typed" and tg["wind"] != "weather", str(tg))
+    check("a new log clears the tags that came from the old data and keeps the typed ones; the track is still loaded, so the weather is applied again"
+          " (air temperature too, since this log has no sensor) without touching the typed humidity",
+          tg["temp"] == "weather" and tg["humid"] == "typed" and tg["curb"] == "typed" and tg["wind"] == "weather", str(tg))
     check("no page errors", not errs, "; ".join(errs))
     await ctx.close()
+
+
+async def auto_weather(browser):
+    """Weather is fetched as soon as a GPS track is matched to a pull, with no tap. That fetch leaves typed fields alone;
+    the Fetch weather again button replaces them. An answer is kept per URL, so a new log on the same track asks once."""
+    txt, t, v = synth_coast(crr=0.0105, grade=-0.004, ambient=71.5)
+    ctx, pg, errs = await open_page(browser, expand=True)
+    reqs = []
+    async def h(r):
+        reqs.append(r.request.url)
+        await r.fulfill(status=200, headers={"access-control-allow-origin": "*", "content-type": "application/json"}, body=wx_json(temp_f=68, msl=1013.25, rh=40))
+    await pg.route("**/*open-meteo.com/**", h)
+    await pg.set_input_files("#file", {"name": "coast.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(600)
+    check("loading a log with no GPS fetches no weather", not reqs, str(reqs))
+    await pg.fill("#humid", "55")
+    await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    msg = await pg.inner_text("#wxmsg")
+    vals = await pg.evaluate("({h: $('#humid').value, w: $('#wind').value, hs: srcOf('humid'), ws: srcOf('wind')})")
+    check("matching a GPS track fetches the weather once with no tap", len(reqs) == 1, str(len(reqs)))
+    check("the automatic fetch fills wind but keeps the humidity that was typed, and says so",
+          vals["h"] == "55" and vals["hs"] == "typed" and vals["ws"] == "weather" and "humidity you typed was kept" in msg, f"{vals} | {msg}")
+    await pg.set_input_files("#file", {"name": "coast2.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(1200)
+    check("a new log on the same track uses the kept answer instead of asking again", len(reqs) == 1, str(len(reqs)))
+    await pg.click("#wxget")
+    await pg.wait_for_timeout(900)
+    vals = await pg.evaluate("({h: $('#humid').value, hs: srcOf('humid')})")
+    check("Fetch weather again asks again and replaces the typed humidity", len(reqs) == 2 and vals["h"] == "40" and vals["hs"] == "weather", f"{len(reqs)} {vals}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # Open-Meteo out of reach: the automatic fetch says so and opens the paste box, and nothing breaks
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda r: r.abort())
+    await pg.set_input_files("#file", {"name": "coast.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    st = await pg.evaluate("({m: $('#wxmsg').className, open: $('#wxman').open, b: $('#wxget').disabled})")
+    check("with Open-Meteo out of reach the automatic fetch shows an error, opens Enter Weather by Hand and leaves the button on",
+          "err" in st["m"] and st["open"] and not st["b"], str(st))
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+
+LOGGER_WX = [("Weather Humidity (%)", lambda r: 63), ("Weather Wind (MPH)", lambda r: 8), ("Weather Wind From (deg)", lambda r: 270),
+             ("Weather Air Temp (F)", lambda r: 55), ("Weather Sea-Level Pressure (hPa)", lambda r: 1020)]
+
+
+async def logger_columns(browser):
+    """What the Dyno Logger app adds: its Open-Meteo weather columns (used in place of a lookup, no request), the phone's barometer
+    (Phone Pressure, used when there is no car pressure) and the barometric altitude in the GPX (<dl:relalt>, preferred for grade)."""
+    txt, t, v = synth_coast(crr=0.0105, grade=-0.004)
+    log = with_cols(txt, [("Phone Pressure (psi)", lambda r: 12.5)] + LOGGER_WX)
+    ctx, pg, errs = await open_page(browser, expand=True)
+    reqs = []
+    async def h(rt):
+        reqs.append(rt.request.url)
+        await rt.fulfill(status=200, headers={"access-control-allow-origin": "*", "content-type": "application/json"}, body=wx_json(temp_f=68, msl=1013.25, rh=40))
+    await pg.route("**/*open-meteo.com/**", h)
+    vals = lambda: pg.evaluate("Object.fromEntries(['humid','temp','wind','wdir','da','grade'].map(id => [id, [document.getElementById(id).value, srcOf(id)]]))")
+    await pg.set_input_files("#file", {"name": "logger.csv", "mimeType": "text/csv", "buffer": log.encode()})
+    await pg.wait_for_timeout(700)
+    f, msg, lmsg = await vals(), await pg.inner_text("#wxmsg"), await pg.inner_text("#msg")
+    check("the log's weather columns fill humidity and air temperature (the log has no sensor) with a weather tag",
+          f["humid"] == ["63", "weather"] and f["temp"] == ["55", "weather"], str(f))
+    check("with no GPS track the log's wind is not applied and the line says it needs the heading",
+          f["wind"][0] == "0" and "heading" in msg, f"{f['wind']} | {msg}")
+    check("Phone Pressure fills the pressure when the log has no ambient pressure, tagged log",
+          "Phone Pressure (psi)" in lmsg and "12.5 psi" in lmsg and f["da"][1] == "log", f"{f['da']} | {lmsg[:200]}")
+    await pg.set_input_files("#gps", {"name": "logger.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=0.0, relalt_grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    f, msg = await vals(), await pg.inner_text("#wxmsg")
+    check("with the GPS track the log's wind is applied with a weather tag", f["wind"] == ["8.0", "weather"] and f["wdir"] == ["270", "weather"], str(f))
+    check("a log with weather columns asks Open-Meteo nothing", not reqs, str(reqs))
+    check("the road grade comes from the barometric altitude, not the flat GPS elevation", f["grade"] == ["-0.4", "gps"], str(f))
+    await pg.click("#wxget")
+    await pg.wait_for_timeout(900)
+    f = await vals()
+    check("Fetch weather again still looks it up from Open-Meteo and replaces the log's", len(reqs) == 1 and f["humid"] == ["40", "weather"], f"{len(reqs)} {f}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # a car pressure column wins over the phone's
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    both = with_cols(txt, [("Ambient Pressure (psi)", lambda r: 13.1), ("Phone Pressure (psi)", lambda r: 12.5)])
+    await pg.set_input_files("#file", {"name": "both.csv", "mimeType": "text/csv", "buffer": both.encode()})
+    await pg.wait_for_timeout(600)
+    lmsg = await pg.inner_text("#msg")
+    check("the car's Ambient Pressure wins over Phone Pressure", "13.1 psi" in lmsg and "Ambient Pressure" in lmsg, lmsg[:200])
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # with sea-level pressure and GPS altitude but no pressure column, the log's weather sets density altitude
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    await pg.set_input_files("#file", {"name": "wx.csv", "mimeType": "text/csv", "buffer": with_cols(txt, LOGGER_WX).encode()})
+    await pg.set_input_files("#gps", {"name": "wx.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    da = await pg.evaluate("[document.getElementById('da').value, srcOf('da'), atm.alt]")
+    want = expected_da(1020, 55, 63, da[2])
+    check("the log's sea-level pressure, reduced to the GPS altitude, sets density altitude with a weather tag",
+          da[1] == "weather" and abs(int(da[0]) - want) <= 1, f"{da} want {want}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+
+async def vehicle_profile(browser):
+    """The logger app's vehicle profile columns fill Curb Weight, Driver + Cargo, Drag Coefficient and Frontal Area (tag log), keep
+    typed fields, ignore values out of range, and change the numbers like typing them would."""
+    txt, t, v = synth_coast(crr=0.0105)
+    prof = with_cols(txt, [("Fuel Level (%)", lambda r: 50), ("Curb Weight (lbs)", lambda r: 3456), ("Driver + Cargo (lbs)", lambda r: 180),
+                           ("Drag Coefficient", lambda r: 0.31), ("Frontal Area (m2)", lambda r: 2.25)])
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    vals = lambda: pg.evaluate("Object.fromEntries(['curb','load','cd','area'].map(id => [id, [document.getElementById(id).value, srcOf(id)]]))")
+    await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(2700)
+    plain = await nums(pg)
+    await pg.set_input_files("#file", {"name": "prof.csv", "mimeType": "text/csv", "buffer": prof.encode()})
+    await pg.wait_for_timeout(2700)
+    f, msg, got = await vals(), await pg.inner_text("#msg"), await nums(pg)
+    check("the profile columns fill the four fields with a log tag", f == {"curb": ["3456", "log"], "load": ["180", "log"], "cd": ["0.31", "log"], "area": ["2.25", "log"]}, str(f))
+    check("the log message names the profile values", "vehicle profile" in msg and "Curb Weight 3,456" in msg, msg[-160:])
+    await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(300)
+    for k, x in (("curb", "3456"), ("load", "180"), ("cd", "0.31"), ("area", "2.25")):
+        await pg.fill("#" + k, x)
+    await pg.wait_for_timeout(2700)
+    typed = await nums(pg)
+    check("profile values give the same numbers as typing them", got == typed and got != plain, f"{plain} {got} {typed}")
+    await pg.fill("#curb", "3000")
+    await pg.set_input_files("#file", {"name": "prof.csv", "mimeType": "text/csv", "buffer": prof.encode()})
+    await pg.wait_for_timeout(600)
+    f = await vals()
+    check("a typed field is kept over the profile", f["curb"] == ["3000", "typed"], str(f))
+    await ctx.close()
+    ctx, pg, errs2 = await open_page(browser, expand=True)
+    bad = with_cols(txt, [("Curb Weight (lbs)", lambda r: 33000), ("Drag Coefficient", lambda r: 32)])
+    await pg.set_input_files("#file", {"name": "bad.csv", "mimeType": "text/csv", "buffer": bad.encode()})
+    await pg.wait_for_timeout(600)
+    f = await vals()
+    check("profile values out of range are ignored", f["curb"] == ["3300", ""] and f["cd"] == ["0.32", ""], str(f))
+    check("no page errors", not errs and not errs2, "; ".join(errs + errs2))
+    await ctx.close()
+
+
+def synth_pair(crr=0.0105, cd=0.32, grade=0.0, wind=0.0, legs=(1, -1), hz=45, lead=6.0, noise=0.0):
+    """A pull east, then a coast per leg (1 = east, -1 = west) on the same road, with a turn-around and a run back up to speed between
+    them. Same physics and car as synth_coast (3,500 lb, 36 kg of wheels, 2.2 m2, rho 1.225), Cd as given. grade: rise per metre going
+    east (so the west leg goes down it); wind: headwind going east in m/s (a tailwind going west). Returns (csv, gpx) with the GPX
+    starting `lead` s before the log, elevation 1,600 m + grade x east distance, and noise m of random GPS elevation error."""
+    import datetime, random
+    rnd = random.Random(3)
+    m, mw = 3500 * LB, 36.0
+    kap = 0.5 * 1.225 * cd * 2.2 / (m + mw)
+    dt = 1.0 / hz
+    rows, pts = [], []
+    st = dict(t=0.0, v=30 * MPH, x=0.0, d=1)
+    base = datetime.datetime(2026, 10, 1, 18, 0, 0)
+
+    def emit(rpm, pedal):
+        t, v, x = st["t"], st["v"], st["x"]
+        rows.append(f"{t:.3f},{rpm:.0f},{round(v / MPH):g},{pedal:g}")
+        if not pts or t - pts[-1][0] >= 0.1 - 1e-9:
+            pts.append((t, x, v))
+
+    def move(acc):
+        st["x"] += st["d"] * st["v"] * dt
+        st["v"] += acc * dt
+        st["t"] += dt
+
+    while st["v"] < 75 * MPH:                          # the pull, going east
+        emit(58.6 * st["v"] / MPH, 100); move(2.0)
+    for leg, d in enumerate(legs):
+        st["d"] = d
+        if leg:                                         # back up to 75 MPH after the turn-around
+            while st["v"] < 75 * MPH:
+                emit(58.6 * st["v"] / MPH, 30); move(1.5)
+        for _ in range(int(2 * hz)):                    # cruise in gear
+            emit(58.6 * st["v"] / MPH, 20); move(0.0)
+        t_lift, rpm0, hw = st["t"], 58.6 * st["v"] / MPH, wind * d
+        f = lambda x: -(kap * (x + hw) * abs(x + hw) + (crr * m * G + m * G * grade * d) / (m + mw))
+        while st["v"] > 30 * MPH:
+            el = st["t"] - t_lift
+            emit(850 + (rpm0 - 850) * math.exp(-max(0.0, el - 0.15) / 0.8), 0)
+            v = st["v"]
+            k1 = f(v); k2 = f(v + dt / 2 * k1); k3 = f(v + dt / 2 * k2); k4 = f(v + dt * k3)
+            st["x"] += d * v * dt
+            st["v"] += dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            st["t"] += dt
+    for _ in range(int(2 * hz)):
+        emit(58.6 * st["v"] / MPH, 20); move(0.0)
+    csv = "Time (sec),Engine Speed (RPM),Vehicle Speed (mph),Accel Pedal Position (%)\n" + "\n".join(rows)
+    gp = [(-lead, 0.0, pts[0][2])] + pts
+    out = []
+    for t, x, v in gp:
+        ts = (base + datetime.timedelta(seconds=t + lead)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        out.append(f'<trkpt lat="39.7400000" lon="{-104.98 + x / (111320 * math.cos(math.radians(39.74))):.7f}"><ele>{1600 + grade * x + rnd.gauss(0, noise):.2f}</ele>'
+                   f'<time>{ts}</time><speed>{v:.3f}</speed></trkpt>')
+    return csv, '<?xml version="1.0"?><gpx version="1.1" creator="synthetic"><trk><trkseg>' + "".join(out) + "</trkseg></trk></gpx>"
+
+
+async def two_way_coasts(browser):
+    """Drag Coefficient and Rolling Resistance fitted together from two coasts the opposite way on the same stretch (pairFit), on
+    generated runs with a known answer: a hill and a wind that one coast cannot separate from drag."""
+    async def run(csv, gpx, before=None):
+        ctx, pg, errs = await open_page(browser, expand=True)
+        await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+        if before:
+            await before(pg)
+        await pg.set_input_files("#file", {"name": "pair.csv", "mimeType": "text/csv", "buffer": csv.encode()})
+        await pg.set_input_files("#gps", {"name": "pair.gpx", "mimeType": "application/gpx+xml", "buffer": gpx.encode()})
+        await pg.wait_for_timeout(1200)
+        await pg.fill("#da", "0")                       # the generated air is sea level, rho 1.225
+        await pg.wait_for_timeout(600)
+        st = await pg.evaluate("""() => ({cd: +document.getElementById('cd').value, crr: +document.getElementById('crr').value,
+            cdTag: srcOf('cd'), crrTag: srcOf('crr'), line: (document.getElementById('coastmsg') || {}).textContent || '',
+            sig: coast && coast.pair ? [coast.pair.sCd, coast.pair.sCrr] : null, status: coast && coast.status})""")
+        await ctx.close()
+        return st, errs
+    errs_all = []
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0))
+    errs_all += e
+    check("two opposite coasts on a hill in a wind fit Cd and Crr (0.368, 0.0105), tagged coast",
+          st["status"] == "pair" and abs(st["cd"] - 0.368) <= 0.012 and abs(st["crr"] - 0.0105) <= 0.0008 and st["cdTag"] == "coast" and st["crrTag"] == "coast", str(st))
+    check("the stated uncertainty covers the error", st["sig"] and abs(st["cd"] - 0.368) <= 2 * st["sig"][0] + .001 and abs(st["crr"] - 0.0105) <= 2 * st["sig"][1] + .0005, str(st["sig"]))
+    check("the line says Drag Coefficient was set from two coasts", "Drag Coefficient set to" in st["line"] and "opposite way" in st["line"], st["line"][:160])
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0, noise=0.5))
+    errs_all += e
+    check("with 0.5 m of GPS elevation noise the pair is still within its stated uncertainty or left alone",
+          (st["status"] == "pair" and abs(st["cd"] - 0.368) <= 2 * st["sig"][0] + .001) or (st["status"] != "pair" and st["cd"] == 0.32), str(st))
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0, legs=(1, 1)))
+    errs_all += e
+    check("two coasts the same way do not fit drag (Cd stays 0.32, untagged)", st["status"] != "pair" and st["cd"] == 0.32 and st["cdTag"] == "", str(st))
+    async def typed(pg):
+        await pg.fill("#cd", "0.30")
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0), before=typed)
+    errs_all += e
+    check("a typed Drag Coefficient is kept and the line says what was measured", st["cd"] == 0.30 and st["cdTag"] == "typed" and "kept" in st["line"], str(st))
+    check("no page errors", not errs_all, "; ".join(errs_all))
 
 
 async def main():
@@ -733,6 +980,10 @@ async def main():
         await boost_tile(browser)
         await coast_fit(browser)
         await field_tags(browser)
+        await auto_weather(browser)
+        await logger_columns(browser)
+        await vehicle_profile(browser)
+        await two_way_coasts(browser)
         await weather_pressure_temp(browser)
         if LOG:
             await with_log(browser)
