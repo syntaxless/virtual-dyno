@@ -538,9 +538,10 @@ def synth_coast(crr=0.0105, grade=0.0, wind=0.0, cda_scale=1.0, v_lift=100, v_st
     return "\n".join([",".join(hdr)] + rows), times, speeds
 
 
-def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10):
+def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10, relalt_grade=None):
     """A GPX of the same drive, due east at 39.74 N, elevation 1,600 m + grade x distance, speed in m/s, starting `lead` s before the log
-    at 2026-10-01 18:00 UTC. Exact: no GPS noise."""
+    at 2026-10-01 18:00 UTC. Exact: no GPS noise. relalt_grade adds the Dyno Logger app's barometric altitude (<dl:relalt>, metres since
+    the start) on that grade, which the page should prefer over <ele> for road grade."""
     import datetime
     base = datetime.datetime(2026, 10, 1, 18, 0, 0)
     T = [-lead] + times + [times[-1] + 4.0]
@@ -565,7 +566,9 @@ def synth_track(times, speeds, grade=0.0, lead=6.0, hz=10):
         d, vv = at(x, D), at(x, V)
         ts = (base + datetime.timedelta(seconds=x + lead)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         pts.append(f'<trkpt lat="39.7400000" lon="{-104.98 + d / (111320 * math.cos(math.radians(39.74))):.7f}"><ele>{1600 + grade * d:.2f}</ele>'
-                   f'<time>{ts}</time><speed>{vv:.3f}</speed></trkpt>')
+                   f'<time>{ts}</time><speed>{vv:.3f}</speed>'
+                   + (f'<dl:relalt>{relalt_grade * d:.2f}</dl:relalt><dl:pressure>{1013 - relalt_grade * d * .12:.2f}</dl:pressure>' if relalt_grade is not None else "")
+                   + '</trkpt>')
         x += 1.0 / hz
     return '<?xml version="1.0"?><gpx version="1.1" creator="synthetic"><trk><trkseg>' + "".join(pts) + "</trkseg></trk></gpx>"
 
@@ -768,6 +771,69 @@ async def auto_weather(browser):
     await ctx.close()
 
 
+LOGGER_WX = [("Weather Humidity (%)", lambda r: 63), ("Weather Wind (MPH)", lambda r: 8), ("Weather Wind From (deg)", lambda r: 270),
+             ("Weather Air Temp (F)", lambda r: 55), ("Weather Sea-Level Pressure (hPa)", lambda r: 1020)]
+
+
+async def logger_columns(browser):
+    """What the Dyno Logger app adds: its Open-Meteo weather columns (used in place of a lookup, no request), the phone's barometer
+    (Phone Pressure, used when there is no car pressure) and the barometric altitude in the GPX (<dl:relalt>, preferred for grade)."""
+    txt, t, v = synth_coast(crr=0.0105, grade=-0.004)
+    log = with_cols(txt, [("Phone Pressure (psi)", lambda r: 12.5)] + LOGGER_WX)
+    ctx, pg, errs = await open_page(browser, expand=True)
+    reqs = []
+    async def h(rt):
+        reqs.append(rt.request.url)
+        await rt.fulfill(status=200, headers={"access-control-allow-origin": "*", "content-type": "application/json"}, body=wx_json(temp_f=68, msl=1013.25, rh=40))
+    await pg.route("**/*open-meteo.com/**", h)
+    vals = lambda: pg.evaluate("Object.fromEntries(['humid','temp','wind','wdir','da','grade'].map(id => [id, [document.getElementById(id).value, srcOf(id)]]))")
+    await pg.set_input_files("#file", {"name": "logger.csv", "mimeType": "text/csv", "buffer": log.encode()})
+    await pg.wait_for_timeout(700)
+    f, msg, lmsg = await vals(), await pg.inner_text("#wxmsg"), await pg.inner_text("#msg")
+    check("the log's weather columns fill humidity and air temperature (the log has no sensor) with a weather tag",
+          f["humid"] == ["63", "weather"] and f["temp"] == ["55", "weather"], str(f))
+    check("with no GPS track the log's wind is not applied and the line says it needs the heading",
+          f["wind"][0] == "0" and "heading" in msg, f"{f['wind']} | {msg}")
+    check("Phone Pressure fills the pressure when the log has no ambient pressure, tagged log",
+          "Phone Pressure (psi)" in lmsg and "12.5 psi" in lmsg and f["da"][1] == "log", f"{f['da']} | {lmsg[:200]}")
+    await pg.set_input_files("#gps", {"name": "logger.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=0.0, relalt_grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    f, msg = await vals(), await pg.inner_text("#wxmsg")
+    check("with the GPS track the log's wind is applied with a weather tag", f["wind"] == ["8.0", "weather"] and f["wdir"] == ["270", "weather"], str(f))
+    check("a log with weather columns asks Open-Meteo nothing", not reqs, str(reqs))
+    check("the road grade comes from the barometric altitude, not the flat GPS elevation", f["grade"] == ["-0.4", "gps"], str(f))
+    await pg.click("#wxget")
+    await pg.wait_for_timeout(900)
+    f = await vals()
+    check("Fetch weather again still looks it up from Open-Meteo and replaces the log's", len(reqs) == 1 and f["humid"] == ["40", "weather"], f"{len(reqs)} {f}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # a car pressure column wins over the phone's
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    both = with_cols(txt, [("Ambient Pressure (psi)", lambda r: 13.1), ("Phone Pressure (psi)", lambda r: 12.5)])
+    await pg.set_input_files("#file", {"name": "both.csv", "mimeType": "text/csv", "buffer": both.encode()})
+    await pg.wait_for_timeout(600)
+    lmsg = await pg.inner_text("#msg")
+    check("the car's Ambient Pressure wins over Phone Pressure", "13.1 psi" in lmsg and "Ambient Pressure" in lmsg, lmsg[:200])
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # with sea-level pressure and GPS altitude but no pressure column, the log's weather sets density altitude
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    await pg.set_input_files("#file", {"name": "wx.csv", "mimeType": "text/csv", "buffer": with_cols(txt, LOGGER_WX).encode()})
+    await pg.set_input_files("#gps", {"name": "wx.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    da = await pg.evaluate("[document.getElementById('da').value, srcOf('da'), atm.alt]")
+    want = expected_da(1020, 55, 63, da[2])
+    check("the log's sea-level pressure, reduced to the GPS altitude, sets density altitude with a weather tag",
+          da[1] == "weather" and abs(int(da[0]) - want) <= 1, f"{da} want {want}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+
 async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
@@ -779,6 +845,7 @@ async def main():
         await coast_fit(browser)
         await field_tags(browser)
         await auto_weather(browser)
+        await logger_columns(browser)
         await weather_pressure_temp(browser)
         if LOG:
             await with_log(browser)

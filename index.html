@@ -309,7 +309,9 @@ function parse(text){
   const ti=f(/time/i),ri=f(/rpm|engine speed/i);
   let si=f(/vehicle speed|veh.*spd|vss/i);if(si<0)si=f(/speed/i,/engine|rpm/i);
   let pi=f(/pedal/i);if(pi<0)pi=f(/throttle/i,/target|desired/i);
-  const ai=f(/ambient/i,/press|baro/i),bi=f(/ambient.*press|baro/i);
+  const ai=f(/ambient/i,/press|baro/i),phi=f(/^phone pressure/i);let bi=f(/ambient.*press|baro/i);
+  // Columns the Dyno Logger app adds: Open-Meteo's weather where the phone was at the run (one value per row, nearest snapshot)
+  const wc={rh:f(/^weather humidity/i),ws:f(/^weather wind \(/i),wd:f(/^weather wind from/i),tF:f(/^weather air temp/i),msl:f(/^weather sea-level pressure/i)},wv={rh:[],ws:[],wd:[],tF:[],msl:[]},ph=[];
   let oi=f(/boost/i,/trgt|target|set ?p|desired|request|duty|wastegate|solenoid|control/i);if(oi<0)oi=f(/rel.*manifold|manifold.*rel/i,/trgt|target|set ?p|desired/i);
   const bu=/kpa/i.test(H[oi]||'')?1/6.89476:/mbar|hpa/i.test(H[oi]||'')?1/68.9476:/\bbar\b/i.test(H[oi]||'')?14.5038:/inhg/i.test(H[oi]||'')?.491154:1;
   if(ti<0||ri<0||si<0)throw Error('Need Time, Engine Speed (RPM) and Vehicle Speed columns. Found: '+H.join(', '));
@@ -319,6 +321,8 @@ function parse(text){
     if([c[ti],c[ri],c[si]].some(isNaN)||(t.length&&c[ti]<=t[t.length-1]))continue;
     if(ai>=0&&!isNaN(c[ai]))am.push(c[ai]);
     if(bi>=0&&!isNaN(c[bi]))bm.push(c[bi]);
+    if(phi>=0&&!isNaN(c[phi]))ph.push(c[phi]);
+    for(const k in wc)if(wc[k]>=0&&!isNaN(c[wc[k]]))wv[k].push(c[wc[k]]);
     bo.push(oi>=0&&!isNaN(c[oi])?c[oi]*bu:NaN);t.push(c[ti]);rpm.push(c[ri]);v.push(c[si]*su);ped.push(pi>=0&&!isNaN(c[pi])?c[pi]:null)}
   if(t.length<30)throw Error('Only '+t.length+' usable rows found. The log is too short to analyze.');
   let ts=/ms|milli/i.test(H[ti])?.001:1;if(ts==1&&(t[t.length-1]-t[0])/t.length>5)ts=.001;
@@ -327,9 +331,16 @@ function parse(text){
   let amb=null,an=' No ambient air temp column was found, so the air temp field was left as is.';
   if(ai>=0&&am.length){const isC=/\bc\)|°\s*c|celsius/i.test(H[ai]),a=am.reduce((s,x)=>s+x,0)/am.length,F=isC?a*9/5+32:a;
     if(F>-40&&F<150){amb=Math.round(F*10)/10;an=` Air temp set to ${amb} °F from the average of “${H[ai]}”.`}}
+  if(!baro&&ph.length){const b=ph.reduce((s,x)=>s+x,0)/ph.length;if(b>8&&b<16){baro=Math.round(b*100)/100;bi=phi}}   // the phone's barometer, when there is no car baro
   if(baro)an+=` Pressure set to ${baro} psi from “${H[bi]}”.`;
+  // the weather columns: their mean (wind direction as a vector mean, weighted by speed)
+  const avg=a=>a.length?a.reduce((s,x)=>s+x,0)/a.length:null;let wx=null;
+  if(wv.rh.length||wv.ws.length||wv.tF.length){wx={rh:avg(wv.rh),tF:avg(wv.tF),msl:avg(wv.msl),ws:null,wd:null};
+    const n=Math.min(wv.ws.length,wv.wd.length);if(n){let u=0,w=0;for(let i=0;i<n;i++){const a=wv.wd[i]*Math.PI/180;u+=wv.ws[i]*Math.sin(a);w+=wv.ws[i]*Math.cos(a)}
+      wx.ws=Math.hypot(u,w)/n;wx.wd=(Math.atan2(u,w)*180/Math.PI+360)%360}
+    if(wx.rh!=null&&!(wx.rh>=0&&wx.rh<=100))wx.rh=null;if(wx.tF!=null&&!(wx.tF>-40&&wx.tF<150))wx.tF=null;if(wx.msl!=null&&!(wx.msl>870&&wx.msl<1090))wx.msl=null}
   const hasB=oi>=0&&bo.some(isFinite);
-  return{t,rpm,v,ped:pi>=0?ped:null,boost:hasB?bo:null,n:t.length,amb,baro,info:`Using “${H[ri]}”, “${H[si]}”, ${pi>=0?'“'+H[pi]+'”':'no pedal column (pulls found from RPM and speed only)'}.${hasB?` Boost from “${H[oi]}”.`:''}${an}`}}
+  return{t,rpm,v,ped:pi>=0?ped:null,boost:hasB?bo:null,n:t.length,amb,baro,wx,info:`Using “${H[ri]}”, “${H[si]}”, ${pi>=0?'“'+H[pi]+'”':'no pedal column (pulls found from RPM and speed only)'}.${hasB?` Boost from “${H[oi]}”.`:''}${an}`}}
 
 /* Coast-down: Rolling Resistance from a slow-down with the pedal off and the clutch in. Then nothing but the road and the air acts on the car:
      (m+mw) dv/dt = -( 0.5 rho Cd A (v+wind)|v+wind| + Crr m g + m g sin(grade) )
@@ -385,7 +396,7 @@ function coastFit(sg,X){
       sig=Math.hypot(Math.max(.13,rms)/Math.sqrt(stt)*f,           // scatter of the speed (a whole MPH is about .13 m/s rms)
         .05*kap*sl(I)*f,                                             // drag area 5% off
         3*MPH*2*kap*sl(J)*f,                                         // wind 3 MPH off
-        (gps?1.5/Math.max(L,1):.0015));                              // grade: 1.5 m of GPS elevation drift over the coast, or 0.15% for one the user typed
+        (gps?(gps.baro?.4:1.5)/Math.max(L,1):.0015));                // grade: 1.5 m of GPS elevation drift over the coast (0.4 m of barometric altitude), or 0.15% for one the user typed
     const crr=-sy*f-Math.sin(Math.atan(gd));
     if(!best||sig<best.sig)best={a:i0,b:sg.b,dur:t[sg.b]-t[i0],v0:v[i0]/MPH,v1:v[sg.b]/MPH,crr,sig,rms:rms/MPH,gps:!!gps,assumed:!gps&&!X.typed,grade:gd*100,len:L}}
   return best}
@@ -577,7 +588,7 @@ function syncDA(){if(!daAuto)return;const d=calcDA();if(d!=null){$('#da').value=
 
 function load(text,name,fname){   // fname: what Print names its file after, when it is not the name shown in the message
   const M=$('#msg');fresh=true;wxReq++;$('#wxmsg').textContent='';
-  try{D=parse(text);logName=fname||name;M.className='msg';M.textContent=`${name}: ${D.n.toLocaleString()} rows. ${D.info}`;clearSrc();crrAuto=true;if(D.amb!=null){$('#temp').value=D.amb;src('temp','log')}atm.baro=D.baro||0;atm.wp=0;daAuto=true;syncDA();if(atm.baro)M.textContent+=` Density altitude set to ${$('#da').value} ft from the log's pressure and temperature.`;analyze(true)}
+  try{D=parse(text);logName=fname||name;M.className='msg';M.textContent=`${name}: ${D.n.toLocaleString()} rows. ${D.info}`;clearSrc();crrAuto=true;if(D.amb!=null){$('#temp').value=D.amb;src('temp','log')}atm.baro=D.baro||0;atm.wp=0;daAuto=true;syncDA();if(atm.baro)M.textContent+=` Density altitude set to ${$('#da').value} ft from the log's pressure and temperature.`;analyze(true);if(!gi)logWx()}
   catch(e){D=null;logName='';pulls=[];M.className='msg err';M.textContent=e.message;render();wxVis()}}
 
 function demo(){
@@ -598,8 +609,9 @@ function parseGPS(text){
   let P=[],auto=false;
   if(/<trkpt|<rtept/i.test(text)){
     for(const m of text.matchAll(/<(?:trkpt|rtept)([^>]*)>([\s\S]*?)<\/(?:trkpt|rtept)>/gi)){
-      const la=/lat="([^"]+)"/.exec(m[1]),lo=/lon="([^"]+)"/.exec(m[1]),el=/<ele>([^<]+)</.exec(m[2]),tm=/<time>([^<]+)</.exec(m[2]),sp=/<speed>([^<]+)</.exec(m[2]);
-      if(la&&lo&&tm)P.push({lat:+la[1],lon:+lo[1],ele:el?+el[1]:null,t:Date.parse(tm[1])/1e3,v:sp?+sp[1]:null})}
+      const la=/lat="([^"]+)"/.exec(m[1]),lo=/lon="([^"]+)"/.exec(m[1]),el=/<ele>([^<]+)</.exec(m[2]),tm=/<time>([^<]+)</.exec(m[2]),sp=/<speed>([^<]+)</.exec(m[2]),ra=/<(?:\w+:)?relalt>([^<]+)</.exec(m[2]);
+      // relalt: the Dyno Logger app's barometric altitude change (m), in its own namespace; a much steadier grade than GPS <ele>
+      if(la&&lo&&tm)P.push({lat:+la[1],lon:+lo[1],ele:el?+el[1]:null,t:Date.parse(tm[1])/1e3,v:sp?+sp[1]:null,ra:ra&&isFinite(+ra[1])?+ra[1]:null})}
   }else{
     const L=text.replace(/\r/g,'').split('\n').filter(l=>l.trim()),hi=Math.max(0,L.findIndex(l=>/lat/i.test(l)&&/lon|lng/i.test(l))),H=L[hi].split(',').map(s=>s.trim().replace(/"/g,'')),f=re=>H.findIndex(h=>re.test(h));
     const la=f(/^lat/i),lo=f(/^(lon|lng)/i),el=f(/ele|alt/i),tm=f(/time|date|stamp/i),sp=f(/^speed|velocity/i);
@@ -622,10 +634,12 @@ const gAt=(T,k)=>{const g=GPS;let lo=0,hi=g.length-1;if(T<=g[0].t)return g[0][k]
 function elev(T0,T1){
   const W=GPS.filter(p=>p.t>=T0&&p.t<=T1&&p.ele!=null);let grade=null,alt=null,len=0;
   if(W.length){alt=W.reduce((s,p)=>s+p.ele,0)/W.length/.3048}
+  // grade from the phone's barometric altitude when every point has it, else from GPS elevation
+  const baro=W.length>=4&&W.every(p=>p.ra!=null),z=p=>baro?p.ra:p.ele;
   if(W.length>=4){const X=[0];for(let i=1;i<W.length;i++)X.push(X[i-1]+dist(W[i-1],W[i]));len=X[X.length-1];
-    const mx=X.reduce((s,x)=>s+x,0)/X.length,my=W.reduce((s,p)=>s+p.ele,0)/W.length;let sxy=0,sxx=0;W.forEach((p,i)=>{sxy+=(X[i]-mx)*(p.ele-my);sxx+=(X[i]-mx)**2});
+    const mx=X.reduce((s,x)=>s+x,0)/X.length,my=W.reduce((s,p)=>s+z(p),0)/W.length;let sxy=0,sxx=0;W.forEach((p,i)=>{sxy+=(X[i]-mx)*(z(p)-my);sxx+=(X[i]-mx)**2});
     if(sxx>0)grade=sxy/sxx*100}
-  return{grade,alt,len,n:W.length}}
+  return{grade,alt,len,n:W.length,baro}}
 
 function matchGPS(a,b){
   const{t,v}=D,g=GPS,L=t[b]-t[a],T0=g[0].t,T1=g[g.length-1].t;
@@ -646,7 +660,7 @@ function fromGPS(init){
   if(GPS&&D&&q){gi=matchGPS(q.a,q.b);
     if(gi){if(init&&!D.gpsOnly)$('#spd').value=GPS.hz>=5?'gps':'ecu';const day=x=>new Date(x*1e3).toISOString().slice(0,10),recent=Date.now()/1e3-gi.T<60*86400;
       wxUrl=`https://${recent?'api.open-meteo.com/v1/forecast':'archive-api.open-meteo.com/v1/archive'}?latitude=${gi.lat.toFixed(2)}&longitude=${gi.lon.toFixed(2)}&start_date=${day(gi.T)}&end_date=${day(gi.T+86400)}&hourly=relative_humidity_2m,wind_speed_10m,wind_direction_10m,temperature_2m,pressure_msl&wind_speed_unit=mph&temperature_unit=fahrenheit&timezone=GMT`;$('#wxlink').href=wxUrl;$('#wxman').open=false;$('#wxget').disabled=false;
-      wxReq++;atm.wp=0;$('#wxin').value='';$('#wxmsg').textContent='';setTimeout(getWx);   // weather is fetched for every matched pull, no tap needed
+      wxReq++;atm.wp=0;$('#wxin').value='';$('#wxmsg').textContent='';setTimeout(()=>{if(!logWx())getWx()});   // the logger app's weather if the log has it, else fetched for the matched pull, no tap needed
       const f=(id,x)=>$('#'+id).value=x;f('head',Math.round(gi.head));src('head','gps');f('grade',gi.grade==null?0:gi.grade.toFixed(1));src('grade',gi.grade==null?null:'gps');if(gi.alt!=null){atm.alt=gi.alt;syncDA()}
       const dv=100/gi.ratio-100;M.className='msg'+(gi.err>3*MPH?' err':'');
       M.textContent=`${D.gpsOnly?'Pull located':'GPS matched to this pull (speed error '+(gi.err/MPH).toFixed(1)+' MPH)'} near ${gi.lat.toFixed(4)}, ${gi.lon.toFixed(4)} at ${new Date(gi.T*1e3).toLocaleString()}. Heading ${Math.round(gi.head)}°, grade ${gi.grade==null?'unknown (no elevation)':gi.grade.toFixed(1)+'%'}.${D.gpsOnly?'':` ECU speed reads ${dv>=0?'+':''}${dv.toFixed(1)}% vs GPS.`}`+(gi.err>3*MPH?' The match is poor, so check that this is the right track.':'')}
@@ -771,6 +785,25 @@ const wxLive=id=>id===wxReq;
 function wxVis(){const has=!!D;$('#wx').hidden=!has;$('#wxgps').hidden=!gi;$('#wxman').hidden=!gi;$('#wxpl').hidden=!has||!!gi}
 // Fill a message line from strings and [string] parts; the [string] parts (the weather that was applied) get the accent color.
 function say(M,...parts){M.textContent='';parts.forEach(x=>{if(typeof x=='string')M.append(x);else{const e=document.createElement('span');e.className='ap';e.textContent=x[0];M.append(e)}})}
+// Sea-level pressure (hPa) reduced to the pull's altitude zm (m) with that hour's temperature (F, or a standard day's): Pa
+const station=(pm,zm,tF)=>{const Tk=(tF!=null?(tF-32)*5/9:15-.0065*zm)+273.15;return pm*100*Math.exp(-9.80665*zm/(287.058*(Tk+.0065*zm/2)))};
+// The weather the Dyno Logger app fetched at the run (D.wx, from its Weather columns). It is used in place of a lookup: it is for the
+// moment and place of the run. Like the automatic lookup it leaves typed fields alone; wind needs the car's heading (a GPS track), and
+// sea-level pressure needs the altitude (GPS) and is only used when the log has no pressure of its own. Returns false with no D.wx.
+function logWx(){const w=D&&D.wx,M=$('#wxmsg');if(!w)return false;
+  const own=id=>srcOf(id)=='typed',got=[],kept=[];let pt=[];atm.wp=0;
+  if(w.rh!=null){if(own('humid'))kept.push('humidity');else{$('#humid').value=Math.round(w.rh);src('humid','weather');got.push(`${Math.round(w.rh)}% humidity`)}}
+  if(w.tF!=null&&D.amb==null){if(own('temp'))kept.push('air temperature');else{$('#temp').value=Math.round(w.tF*10)/10;src('temp','weather');got.push(`${Math.round(w.tF)} °F`)}}
+  const wd=w.ws!=null?`${w.ws.toFixed(1)} MPH from ${Math.round(w.wd)}°`:'';
+  if(w.ws!=null&&gi){if(own('wind')||own('wdir'))kept.push('wind');else{$('#wind').value=w.ws.toFixed(1);$('#wdir').value=Math.round(w.wd);src('wind','weather');src('wdir','weather');got.push('wind '+wd)}}
+  if(w.msl!=null&&gi&&gi.alt!=null){const zm=gi.alt*.3048;if(zm>-500&&zm<6000)atm.wp=station(w.msl,zm,w.tF)}
+  syncDA();
+  if(atm.wp>0&&!(atm.baro>0)&&daAuto)pt=[' ',[`Density altitude set to ${$('#da').value} ft`],` from its sea-level pressure (${Math.round(w.msl)} hPa) at ${Math.round(gi.alt)} ft.`];
+  M.className='msg';
+  say(M,'From the weather the logger app saved with this run: ',[got.length?got.join(', '):'nothing new'],'.',
+    w.ws!=null&&!gi?` Wind was ${wd} but needs the car's heading, so load the GPS track too.`:w.ws!=null?' This is 10 m wind, so wind at the road is often lower.':'',...pt,
+    kept.length?` The ${kept.join(' and ')} you typed ${kept.length>1?'were':'was'} kept.`:'',' Fetch weather again looks it up from Open-Meteo instead.');
+  analyze(false);return true}
 function applyWx(text,T,zone,useWind,auto){const M=$('#wxmsg'),own=id=>auto&&srcOf(id)=='typed',kept=[];   // auto: a fetch nobody tapped for leaves typed fields alone
   try{let j;try{j=JSON.parse(text)}catch{throw Error('That does not look like weather data.')}
     const h=j&&j.hourly;
@@ -793,9 +826,7 @@ function applyWx(text,T,zone,useWind,auto){const M=$('#wxmsg'),own=id=>auto&&src
     if(tF!=null&&tF>-40&&tF<150){
       if(D.amb==null){if(own('temp'))kept.push('air temperature');else{$('#temp').value=Math.round(tF*10)/10;src('temp','weather');tt=`, ${Math.round(tF)} °F`}}
       else if(Math.abs(tF-D.amb)>=5)tn=` Open-Meteo has ${Math.round(tF)} °F for that hour. The log's ambient sensor read ${Math.round(D.amb)} °F, and that was kept.`}
-    if(pm!=null&&pm>870&&pm<1090&&zm!=null&&zm>-500&&zm<6000){
-      const Tk=(tF!=null?(tF-32)*5/9:15-.0065*zm)+273.15;
-      atm.wp=pm*100*Math.exp(-9.80665*zm/(287.058*(Tk+.0065*zm/2)))}
+    if(pm!=null&&pm>870&&pm<1090&&zm!=null&&zm>-500&&zm<6000)atm.wp=station(pm,zm,tF);
     if(own('humid'))kept.push('humidity');else{$('#humid').value=Math.round(rh);src('humid','weather')}syncDA();
     if(atm.wp>0&&!(atm.baro>0)&&daAuto)pt=[' ',[`Density altitude set to ${$('#da').value} ft`],` from that hour's sea-level pressure (${Math.round(pm)} hPa) at ${Math.round(zm*3.28084)} ft.`];
     if(useWind&&(own('wind')||own('wdir')))kept.push('wind');else if(useWind){$('#wind').value=sp.toFixed(1);$('#wdir').value=Math.round(dr);src('wind','weather');src('wdir','weather')}

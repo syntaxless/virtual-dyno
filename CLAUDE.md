@@ -191,6 +191,16 @@ https://dyno.turboloser.co (GitHub Pages, served from `main`). The repo is publi
   `applyWx()`, which then leaves any field tagged `typed` (temperature, humidity, wind) alone and says which it kept; the
   button replaces them, as before. A failed automatic fetch shows the usual error and opens Enter Weather by Hand. The
   place-and-date form (no GPS) is unchanged and still needs a tap. `functional.py`'s `auto_weather` checks all of this.
+- **Dyno Logger app columns** (logger 1.1, syntaxless/virtual-dyno-logger). `parse()` reads, by header prefix, `Phone Pressure (psi)`
+  (the iPhone's barometer: used as the pressure only when no `Ambient Pressure`/baro column has a believable value, tagged `log`) and the
+  weather the app fetched from Open-Meteo at the run: `Weather Humidity (%)`, `Weather Wind (MPH)`, `Weather Wind From (deg)`,
+  `Weather Air Temp (F)`, `Weather Sea-Level Pressure (hPa)` (`D.wx`, column means, wind as a speed-weighted vector mean). Their names
+  avoid every word the older column regexes match, so they never displace the Accessport columns. `logWx()` applies `D.wx` in place of
+  a lookup (no request): it runs from `load()` when no GPS is matched and from `fromGPS()` instead of `getWx()`; it keeps typed fields,
+  fills temperature only when the log has no sensor, applies wind only with a GPS heading, and reduces sea-level pressure to the GPS
+  altitude with `station()` (shared with `applyWx`). Fetch weather again still replaces it with a lookup. `parseGPS()` reads the app's
+  `<dl:relalt>` (barometric altitude change, m, any namespace prefix) as `ra`; `elev()` takes the grade from it when every point in the
+  window has one (`baro:true`), and `coastFit()` then counts 0.4 m of drift instead of 1.5 m. `functional.py`'s `logger_columns` checks it.
 - **Density altitude inputs.** The air density comes from the `da`, `temp` and `humid` fields (DA is filled in
   automatically until the user types in it). Its pressure comes from, in order: the log's "Ambient Pressure" column
   (`atm.baro`, a measurement, so it always wins), then the weather answer's sea-level pressure (`pressure_msl`)
