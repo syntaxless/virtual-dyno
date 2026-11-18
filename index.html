@@ -295,7 +295,7 @@ const SRC={log:"From the log",gps:"From the GPS track",weather:"From the weather
 const fieldLabel=id=>{const l=$('#'+id)&&$('#'+id).closest('label.f');return l||null};
 function src(id,kind){const l=fieldLabel(id);if(!l)return;if(kind){l.dataset.src=kind;l.title=SRC[kind]}else{delete l.dataset.src;l.removeAttribute('title')}}
 const srcOf=id=>{const l=fieldLabel(id);return l?l.dataset.src||'':''};
-const clearSrc=()=>FIELDS.forEach(([id])=>{if(id!='crr'&&srcOf(id)!='typed')src(id,null)});   // crr: analyze() decides if an earlier fit still stands
+const clearSrc=()=>FIELDS.forEach(([id])=>{if(id!='crr'&&id!='cd'&&srcOf(id)!='typed')src(id,null)});   // crr: analyze() decides if an earlier fit still stands
 const P=()=>{const o={smooth:+$('#smooth').value};FIELDS.forEach(([id])=>o[id]=+$('#'+id).value);o.corr=$('#corr').value;o.spd=$('#spd').value;return o};
 let D=null,logName='',gpsName='',pulls=[],sel=0,cur=null,hov=-1,mp={},GPS=null,gi=null,cond='',atm={baro:0,wp:0,alt:null},daAuto=true,crrAuto=true,coast=null,fresh=false,shown={},grow=1,gAF=0,AX={u:'RPM',bin:100,tick:500,span:1000};
 const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -379,6 +379,54 @@ function findCoasts(t,v,rpm,ped,kap){
     if(b-a>=20)out.push({a,b,gear:false})}
   return out}
 
+/* Two-way coasts: Drag Coefficient and Rolling Resistance together (logger 1.1). One coast sees drag and rolling resistance mixed with
+   the hill and the wind; two coasts on the same stretch in opposite directions (headings 150 degrees or more apart, middles within half
+   the longer coast plus 500 m) separate them. Each coast j obeys dv/dt = -(kap (v+w_j)^2 + C + gs_j), with kap = 0.5 rho Cd A / (m+mw)
+   and C = Crr g m/(m+mw) shared, gs_j = g sin(grade_j) m/(m+mw) known from the GPS (or barometric) elevation, and the headwind
+   w_j = +w on one coast and -w on the other (the same wind, opposite headings). With (v+w)^2 = v^2 + 2 w v + w^2 and integrating,
+   v + gs_j t = v0_j - kap I_j - 2 kap w s_j D_j - (C + kap w^2) t, where I_j is the integral of v^2, D_j of v (the distance) and s_j
+   is +1 or -1: linear in kap, kap w, C, v0_1 and v0_2, so one least-squares solve fits the wind too (the kap w^2 term, under 0.0002
+   of rolling resistance for a 5 MPH wind, is left in C). The uncertainty adds, in quadrature, the speed scatter (as coastFit), the
+   grade (each coast's elevation drift, same and opposite sign) and, for Cd, 3% of weight (a coast measures drag over mass, so Cd moves
+   with the weight). X: {t,v,m,mw,rho,area}. Returns the best pair, or null. */
+const CD_RANGE=[.2,.6],CD_SIG=.025,CD0=FIELDS.find(f=>f[0]=='cd')[2];
+function pairFit(segs,X){
+  if(!(gi&&GPS&&gi.alt!=null))return null;
+  const{t,v,m,mw,rho,area}=X,f=m/(m+mw);
+  const info=segs.filter(q=>!q.gear&&t[q.b]-t[q.a]>=20&&v[q.a]-v[q.b]>=20*MPH).map(q=>{
+    const T0=t[q.a]+gi.off,T1=t[q.b]+gi.off,p0={lat:gAt(T0,'lat'),lon:gAt(T0,'lon')},p1={lat:gAt(T1,'lat'),lon:gAt(T1,'lon')},
+      mid={lat:gAt((T0+T1)/2,'lat'),lon:gAt((T0+T1)/2,'lon')},g=elev(T0,T1);
+    if(g.grade==null||g.len<300||g.n<8)return null;
+    return{...q,v0:v[q.a]/MPH,v1:v[q.b]/MPH,head:bear(p0,p1),mid,grade:g.grade,len:g.len,baro:g.baro}}).filter(Boolean);
+  const solve=(A,B,dg)=>{   // dg: [grade error of A, of B] (fraction)
+    const rows=[];
+    [[A,0],[B,1]].forEach(([c,j])=>{const gs=G*Math.sin(Math.atan(c.grade/100+dg[j]))*f,sg=j?-1:1;let I=0,Dd=0;
+      for(let i=c.a;i<=c.b;i++){if(i>c.a){const h=t[i]-t[i-1];I+=h*(v[i]*v[i]+v[i-1]*v[i-1])/2;Dd+=h*(v[i]+v[i-1])/2}
+        const T=t[i]-t[c.a];rows.push([-I,-2*sg*Dd,-T,j?0:1,j?1:0,v[i]+gs*T])}});
+    const K=5,N=[...Array(K)].map(()=>Array(K).fill(0)),b=Array(K).fill(0);
+    for(const r of rows)for(let i=0;i<K;i++){b[i]+=r[i]*r[K];for(let k=0;k<K;k++)N[i][k]+=r[i]*r[k]}
+    const inv=invN(N);if(!inv)return null;const x=inv.map(row=>row.reduce((q,y,k)=>q+y*b[k],0));
+    let ss=0;for(const r of rows){let e=r[K];for(let k=0;k<K;k++)e-=r[k]*x[k];ss+=e*e}
+    return{kap:x[0],w:x[0]>0?x[1]/x[0]:0,C:x[2],inv,rms:Math.sqrt(ss/rows.length)}};
+  const toCd=k=>k*(m+mw)*2/(rho*area),toCrr=C=>C/(G*f);
+  let best=null;
+  for(let i=0;i<info.length;i++)for(let k=i+1;k<info.length;k++){
+    const A=info[i],B=info[k],ang=Math.abs(((A.head-B.head+540)%360)-180);
+    if(ang<150||dist(A.mid,B.mid)>Math.max(A.len,B.len)/2+500)continue;   // the same stretch: the middles within half the longer coast and 500 m
+    const s0=solve(A,B,[0,0]);if(!s0||!(s0.kap>0))continue;
+    const se=Math.max(.13,s0.rms),cd=toCd(s0.kap),crr=toCrr(s0.C),
+      eg=[A,B].map(c=>(c.baro?.4:1.5)/Math.max(c.len,1)),
+      d=[solve(A,B,[eg[0],eg[1]]),solve(A,B,[eg[0],-eg[1]])].filter(Boolean),
+      sCd=Math.hypot(se*Math.sqrt(s0.inv[0][0])*(m+mw)*2/(rho*area),...d.map(q=>toCd(q.kap)-cd),.03*cd),
+      sCrr=Math.hypot(se*Math.sqrt(s0.inv[2][2])/(G*f),...d.map(q=>toCrr(q.C)-crr));
+    if(!best||sCd<best.sCd)best={A,B,cd,crr,sCd,sCrr,wind:s0.w/MPH,rms:s0.rms/MPH,ang}}
+  return best}
+// Inverse of a small square matrix (Gauss-Jordan with partial pivoting), or null when it is singular.
+const invN=M=>{const n=M.length,A=M.map((r,i)=>[...r,...r.map((_,k)=>i==k?1:0)]);
+  for(let c=0;c<n;c++){let p=c;for(let r=c+1;r<n;r++)if(Math.abs(A[r][c])>Math.abs(A[p][c]))p=r;if(Math.abs(A[p][c])<1e-12)return null;[A[c],A[p]]=[A[p],A[c]];
+    const d=A[c][c];for(let k=0;k<2*n;k++)A[c][k]/=d;for(let r=0;r<n;r++)if(r!=c){const q=A[r][c];for(let k=0;k<2*n;k++)A[r][k]-=q*A[c][k]}}
+  return A.map(r=>r.slice(n))};
+
 // Fits Crr to the coast, trying the whole coast and its slow end (Crr is most of the slowing at low speed, drag at high speed) and
 // keeping the one with the smallest uncertainty. X: {t,v,kap,hwd,m,mw,grade}; grade is the Road Grade field (%).
 function coastFit(sg,X){
@@ -448,8 +496,16 @@ function analyze(reset){
       const why=best.sig>CRR_SIG?'weak':best.assumed?'nogps':best.rms>1.2?'noisy':best.crr<CRR_RANGE[0]||best.crr>CRR_RANGE[1]?'range':'';
       coast={...best,status:why||(crrAuto?'ok':'kept')};
       if(coast.status=='ok'){p.crr=+best.crr.toFixed(3);$('#crr').value=p.crr.toFixed(3);src('crr','coast')}}
-    else if(all.some(q=>q.gear))coast={status:'gear'}}
-  if((!coast||coast.status!='ok')&&crrAuto&&srcOf('crr')=='coast'){p.crr=CRR0;$('#crr').value=CRR0;src('crr',null)}   // a value from an earlier fit
+    else if(all.some(q=>q.gear))coast={status:'gear'}
+    // two coasts the opposite way on the same stretch: drag and rolling resistance together, in place of the one-coast fit
+    const pr=pairFit(all,{t,v,m,mw,rho,area:p.area});
+    if(pr){const why=pr.rms>1.2?'noisy':pr.sCd>CD_SIG||pr.sCrr>CRR_SIG?'weak':pr.cd<CD_RANGE[0]||pr.cd>CD_RANGE[1]||pr.crr<CRR_RANGE[0]||pr.crr>CRR_RANGE[1]?'range':'';
+      const cdOwn=srcOf('cd')=='typed';
+      if(!why||!coast||coast.status!='ok')coast={pair:pr,status:why||'pair',crr:pr.crr,cdKept:!why&&cdOwn,crrKept:!why&&!crrAuto};   // a loose pair leaves a good one-coast fit alone
+      if(!why){if(!cdOwn){p.cd=+pr.cd.toFixed(3);$('#cd').value=p.cd;src('cd','coast')}
+        if(crrAuto){p.crr=+pr.crr.toFixed(3);$('#crr').value=p.crr.toFixed(3);src('crr','coast')}}}}
+  if(!(coast&&coast.status=='pair')&&srcOf('cd')=='coast'){p.cd=CD0;$('#cd').value=CD0;src('cd',null)}   // a drag value from an earlier pair
+  if((!coast||(coast.status!='ok'&&coast.status!='pair'))&&crrAuto&&srcOf('crr')=='coast'){p.crr=CRR0;$('#crr').value=CRR0;src('crr',null)}   // a value from an earlier fit
   pulls=raw.map(([a,b])=>{const pts=[];
     const tr=Math.round(hw/3),Y=steady(a,b);
     for(let i=a+tr;i<=b-tr;i++){
@@ -504,6 +560,14 @@ function replay(){
 // The coast-down line under the log message: what was found, what it was used for, or why not.
 function coastLine(c){
   const e=document.createElement('span'),ap=x=>{const q=document.createElement('span');q.className='ap';q.textContent=x;return q};e.id='coastmsg';e.append(document.createElement('br'));
+  if(c.pair){const q=c.pair,cr=x=>`${Math.round(q[x].v0)} to ${Math.round(q[x].v1)} MPH heading ${Math.round(q[x].head)}°`;
+    const both=`two coasts the opposite way on the same stretch (${cr('A')}, and ${cr('B')})`,pc=`+/-${q.sCd.toFixed(3)}`,pr=`+/-${Math.max(.0005,q.sCrr).toFixed(4)}`;
+    if(c.status=='pair'){e.append(c.cdKept?`Drag Coefficient measures ${q.cd.toFixed(3)} (${pc}) from ${both}; the value you typed was kept. `:'Drag Coefficient set to ',...(c.cdKept?[]:[ap(q.cd.toFixed(3)),` (${pc}) from ${both}, at the Frontal Area, weight and air in the fields, with ${Math.abs(q.wind).toFixed(1)} MPH of wind along the road. `]),
+      ...(c.crrKept?[`Rolling resistance measures ${q.crr.toFixed(3)} (${pr}); the value you typed was kept.`]:['Rolling Resistance set to ',ap(q.crr.toFixed(3)),` (${pr}).`]))}
+    else if(c.status=='weak')e.append(`Drag and rolling resistance from ${both} are only good to ${pc} and ${pr}, too loose to use, so the fields were left alone. Longer coasts from higher speed, and a known weight, tighten them.`);
+    else if(c.status=='noisy')e.append(`Of ${both}, at least one did not look like a clean coast (braking, or the clutch coming back?), so they were not used.`);
+    else e.append(`From ${both}, drag coefficient ${q.cd.toFixed(3)} and rolling resistance ${q.crr.toFixed(3)} are outside the believable range, so they were not used. Check the weight and Frontal Area fields, and that the road was the same both ways.`);
+    return e}
   if(c.status=='gear'){e.append("The off-throttle slow-down was in gear, where the engine's own braking adds drag, so it was not used for rolling resistance. Press the clutch in (or shift to neutral) to coast.");return e}
   const pm=`+/-${+Math.max(.001,Math.round(c.sig*2000)/2000).toFixed(4)}`,r3=c.crr.toFixed(3),
     run=`${Math.round(c.dur)} s coast (${Math.round(c.v0)} to ${Math.round(c.v1)} MPH)`;

@@ -289,10 +289,24 @@ https://dyno.turboloser.co (GitHub Pages, served from `main`). The repo is publi
   `render()` the way `#nopull` is, built with DOM nodes. Print is unaffected (it reads the field's value). The default log (2.2 s of coast)
   is below the 5 s minimum, so it says nothing and its numbers are unchanged. `functional.py`'s `coast_fit` checks all of this on
   generated logs with a known Crr (`synth_coast`, `synth_track`); the owner's real logs have no usable coast yet, so it is **not yet
-  checked against a real coast**. Not done, on purpose: fitting drag area (the coast sees only drag area per unit mass, so a wrong mass
-  would show up as a wrong Cd x A), averaging a coast in each direction (it cancels hill and wind), and a brake-switch column.
+  checked against a real coast**. A brake-switch column is not read. Drag from a pair of coasts in opposite
+  directions is the next bullet (a single coast still fits Crr only).
   A long coast for a good number: pedal off, clutch in (or neutral), no braking, steady steering, calm wind, from 70 MPH or more down
   to about 30 MPH (60 to 90 s, about a mile), with GPS recording the whole time.
+- **Two-way coasts: Drag Coefficient and Rolling Resistance** (logger 1.1, the owner's goal of measuring every field). `pairFit()`
+  takes two of `findCoasts()`'s clutch-in coasts (20 s and 20 MPH or more each) whose GPS headings are 150 degrees or more apart and
+  whose middles are within half the longer coast plus 500 m, and solves one linear least squares for kap (drag over mass), the wind
+  along the road (fitted: `+w` on one coast and `-w` on the other, through the 2 kap w v term), C (rolling resistance) and a start
+  speed per coast; the grade of each is `elev()` (barometric `<dl:relalt>` when present). Cd = kap (m+mw) 2 / (rho x Frontal Area), so
+  it is only as good as the weight, Frontal Area and density altitude fields. Uncertainty `sCd`/`sCrr`: speed scatter, each coast's
+  elevation drift (1.5 m GPS, 0.4 m barometric; same and opposite sign) and, for Cd, 3% of weight. Used when the fit's rms is under
+  1.2 MPH, `sCd` <= 0.025 (`CD_SIG`), `sCrr` <= `CRR_SIG` and both are in range (Cd 0.2 to 0.6): Cd is set unless typed (tag `coast`,
+  put back to 0.32 by a later log with no pair, like Crr; `clearSrc()` skips `cd` for that), Crr unless typed. A loose pair leaves a
+  good one-coast Crr alone. `coastLine()` reports it, including the fitted wind. Checked by `functional.py`'s `two_way_coasts` on
+  `synth_pair()` runs (a hill and a wind that one coast cannot separate); on 16 random generated runs (Cd 0.28 to 0.42, grade up to 1%,
+  wind up to 3 m/s, GPS elevation noise up to 1 m) the error was under 0.001 in Cd and 0.0002 in Crr against a stated `sCd` of
+  0.009 to 0.017, so the stated figure is cautious on exact physics; real roads (uneven grade, gusts, an unknown weight) will be worse.
+  **Not yet checked against a real pair of coasts.**
 - **Field source tags.** A small tag at the right of a field's box says where its value came from: `log` (air temperature, density altitude
   from the log's pressure), `gps` (heading, grade, density altitude from GPS altitude), `weather` (humidity, wind, wind direction, and
   temperature or density altitude when the log lacks them), `coast` (Rolling Resistance) or `typed`. A field with no tag still holds the

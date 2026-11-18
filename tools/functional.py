@@ -874,6 +874,102 @@ async def vehicle_profile(browser):
     await ctx.close()
 
 
+def synth_pair(crr=0.0105, cd=0.32, grade=0.0, wind=0.0, legs=(1, -1), hz=45, lead=6.0, noise=0.0):
+    """A pull east, then a coast per leg (1 = east, -1 = west) on the same road, with a turn-around and a run back up to speed between
+    them. Same physics and car as synth_coast (3,500 lb, 36 kg of wheels, 2.2 m2, rho 1.225), Cd as given. grade: rise per metre going
+    east (so the west leg goes down it); wind: headwind going east in m/s (a tailwind going west). Returns (csv, gpx) with the GPX
+    starting `lead` s before the log, elevation 1,600 m + grade x east distance, and noise m of random GPS elevation error."""
+    import datetime, random
+    rnd = random.Random(3)
+    m, mw = 3500 * LB, 36.0
+    kap = 0.5 * 1.225 * cd * 2.2 / (m + mw)
+    dt = 1.0 / hz
+    rows, pts = [], []
+    st = dict(t=0.0, v=30 * MPH, x=0.0, d=1)
+    base = datetime.datetime(2026, 10, 1, 18, 0, 0)
+
+    def emit(rpm, pedal):
+        t, v, x = st["t"], st["v"], st["x"]
+        rows.append(f"{t:.3f},{rpm:.0f},{round(v / MPH):g},{pedal:g}")
+        if not pts or t - pts[-1][0] >= 0.1 - 1e-9:
+            pts.append((t, x, v))
+
+    def move(acc):
+        st["x"] += st["d"] * st["v"] * dt
+        st["v"] += acc * dt
+        st["t"] += dt
+
+    while st["v"] < 75 * MPH:                          # the pull, going east
+        emit(58.6 * st["v"] / MPH, 100); move(2.0)
+    for leg, d in enumerate(legs):
+        st["d"] = d
+        if leg:                                         # back up to 75 MPH after the turn-around
+            while st["v"] < 75 * MPH:
+                emit(58.6 * st["v"] / MPH, 30); move(1.5)
+        for _ in range(int(2 * hz)):                    # cruise in gear
+            emit(58.6 * st["v"] / MPH, 20); move(0.0)
+        t_lift, rpm0, hw = st["t"], 58.6 * st["v"] / MPH, wind * d
+        f = lambda x: -(kap * (x + hw) * abs(x + hw) + (crr * m * G + m * G * grade * d) / (m + mw))
+        while st["v"] > 30 * MPH:
+            el = st["t"] - t_lift
+            emit(850 + (rpm0 - 850) * math.exp(-max(0.0, el - 0.15) / 0.8), 0)
+            v = st["v"]
+            k1 = f(v); k2 = f(v + dt / 2 * k1); k3 = f(v + dt / 2 * k2); k4 = f(v + dt * k3)
+            st["x"] += d * v * dt
+            st["v"] += dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            st["t"] += dt
+    for _ in range(int(2 * hz)):
+        emit(58.6 * st["v"] / MPH, 20); move(0.0)
+    csv = "Time (sec),Engine Speed (RPM),Vehicle Speed (mph),Accel Pedal Position (%)\n" + "\n".join(rows)
+    gp = [(-lead, 0.0, pts[0][2])] + pts
+    out = []
+    for t, x, v in gp:
+        ts = (base + datetime.timedelta(seconds=t + lead)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        out.append(f'<trkpt lat="39.7400000" lon="{-104.98 + x / (111320 * math.cos(math.radians(39.74))):.7f}"><ele>{1600 + grade * x + rnd.gauss(0, noise):.2f}</ele>'
+                   f'<time>{ts}</time><speed>{v:.3f}</speed></trkpt>')
+    return csv, '<?xml version="1.0"?><gpx version="1.1" creator="synthetic"><trk><trkseg>' + "".join(out) + "</trkseg></trk></gpx>"
+
+
+async def two_way_coasts(browser):
+    """Drag Coefficient and Rolling Resistance fitted together from two coasts the opposite way on the same stretch (pairFit), on
+    generated runs with a known answer: a hill and a wind that one coast cannot separate from drag."""
+    async def run(csv, gpx, before=None):
+        ctx, pg, errs = await open_page(browser, expand=True)
+        await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+        if before:
+            await before(pg)
+        await pg.set_input_files("#file", {"name": "pair.csv", "mimeType": "text/csv", "buffer": csv.encode()})
+        await pg.set_input_files("#gps", {"name": "pair.gpx", "mimeType": "application/gpx+xml", "buffer": gpx.encode()})
+        await pg.wait_for_timeout(1200)
+        await pg.fill("#da", "0")                       # the generated air is sea level, rho 1.225
+        await pg.wait_for_timeout(600)
+        st = await pg.evaluate("""() => ({cd: +document.getElementById('cd').value, crr: +document.getElementById('crr').value,
+            cdTag: srcOf('cd'), crrTag: srcOf('crr'), line: (document.getElementById('coastmsg') || {}).textContent || '',
+            sig: coast && coast.pair ? [coast.pair.sCd, coast.pair.sCrr] : null, status: coast && coast.status})""")
+        await ctx.close()
+        return st, errs
+    errs_all = []
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0))
+    errs_all += e
+    check("two opposite coasts on a hill in a wind fit Cd and Crr (0.368, 0.0105), tagged coast",
+          st["status"] == "pair" and abs(st["cd"] - 0.368) <= 0.012 and abs(st["crr"] - 0.0105) <= 0.0008 and st["cdTag"] == "coast" and st["crrTag"] == "coast", str(st))
+    check("the stated uncertainty covers the error", st["sig"] and abs(st["cd"] - 0.368) <= 2 * st["sig"][0] + .001 and abs(st["crr"] - 0.0105) <= 2 * st["sig"][1] + .0005, str(st["sig"]))
+    check("the line says Drag Coefficient was set from two coasts", "Drag Coefficient set to" in st["line"] and "opposite way" in st["line"], st["line"][:160])
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0, noise=0.5))
+    errs_all += e
+    check("with 0.5 m of GPS elevation noise the pair is still within its stated uncertainty or left alone",
+          (st["status"] == "pair" and abs(st["cd"] - 0.368) <= 2 * st["sig"][0] + .001) or (st["status"] != "pair" and st["cd"] == 0.32), str(st))
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0, legs=(1, 1)))
+    errs_all += e
+    check("two coasts the same way do not fit drag (Cd stays 0.32, untagged)", st["status"] != "pair" and st["cd"] == 0.32 and st["cdTag"] == "", str(st))
+    async def typed(pg):
+        await pg.fill("#cd", "0.30")
+    st, e = await run(*synth_pair(crr=0.0105, cd=0.368, grade=0.004, wind=2.0), before=typed)
+    errs_all += e
+    check("a typed Drag Coefficient is kept and the line says what was measured", st["cd"] == 0.30 and st["cdTag"] == "typed" and "kept" in st["line"], str(st))
+    check("no page errors", not errs_all, "; ".join(errs_all))
+
+
 async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
@@ -887,6 +983,7 @@ async def main():
         await auto_weather(browser)
         await logger_columns(browser)
         await vehicle_profile(browser)
+        await two_way_coasts(browser)
         await weather_pressure_temp(browser)
         if LOG:
             await with_log(browser)
