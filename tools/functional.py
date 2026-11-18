@@ -697,8 +697,8 @@ async def field_tags(browser):
     await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
     await pg.wait_for_timeout(1500)
     tg = await tags()
-    check("heading and grade from the GPS track are tagged gps, density altitude too (its pressure is the GPS altitude)",
-          tg["head"] == "gps" and tg["grade"] == "gps" and tg["da"] == "gps", str(tg))
+    check("heading and grade from the GPS track are tagged gps, and the weather fetched on its own fills humidity, wind and density altitude",
+          tg["head"] == "gps" and tg["grade"] == "gps" and tg["da"] == "weather" and tg["humid"] == "weather" and tg["wind"] == "weather", str(tg))
     check("the coast fit is tagged coast", tg["crr"] in ("coast", ""), str(tg))
     await pg.click("#wxget")
     await pg.wait_for_timeout(900)
@@ -717,8 +717,53 @@ async def field_tags(browser):
     await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": synth_coast(mode="none")[0].encode()})
     await pg.wait_for_timeout(600)
     tg = await tags()
-    check("a new log clears the tags that came from the old data and keeps the typed ones",
-          tg["temp"] == "" and tg["humid"] == "typed" and tg["curb"] == "typed" and tg["wind"] != "weather", str(tg))
+    check("a new log clears the tags that came from the old data and keeps the typed ones; the track is still loaded, so the weather is applied again"
+          " (air temperature too, since this log has no sensor) without touching the typed humidity",
+          tg["temp"] == "weather" and tg["humid"] == "typed" and tg["curb"] == "typed" and tg["wind"] == "weather", str(tg))
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+
+async def auto_weather(browser):
+    """Weather is fetched as soon as a GPS track is matched to a pull, with no tap. That fetch leaves typed fields alone;
+    the Fetch weather again button replaces them. An answer is kept per URL, so a new log on the same track asks once."""
+    txt, t, v = synth_coast(crr=0.0105, grade=-0.004, ambient=71.5)
+    ctx, pg, errs = await open_page(browser, expand=True)
+    reqs = []
+    async def h(r):
+        reqs.append(r.request.url)
+        await r.fulfill(status=200, headers={"access-control-allow-origin": "*", "content-type": "application/json"}, body=wx_json(temp_f=68, msl=1013.25, rh=40))
+    await pg.route("**/*open-meteo.com/**", h)
+    await pg.set_input_files("#file", {"name": "coast.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(600)
+    check("loading a log with no GPS fetches no weather", not reqs, str(reqs))
+    await pg.fill("#humid", "55")
+    await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    msg = await pg.inner_text("#wxmsg")
+    vals = await pg.evaluate("({h: $('#humid').value, w: $('#wind').value, hs: srcOf('humid'), ws: srcOf('wind')})")
+    check("matching a GPS track fetches the weather once with no tap", len(reqs) == 1, str(len(reqs)))
+    check("the automatic fetch fills wind but keeps the humidity that was typed, and says so",
+          vals["h"] == "55" and vals["hs"] == "typed" and vals["ws"] == "weather" and "humidity you typed was kept" in msg, f"{vals} | {msg}")
+    await pg.set_input_files("#file", {"name": "coast2.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(1200)
+    check("a new log on the same track uses the kept answer instead of asking again", len(reqs) == 1, str(len(reqs)))
+    await pg.click("#wxget")
+    await pg.wait_for_timeout(900)
+    vals = await pg.evaluate("({h: $('#humid').value, hs: srcOf('humid')})")
+    check("Fetch weather again asks again and replaces the typed humidity", len(reqs) == 2 and vals["h"] == "40" and vals["hs"] == "weather", f"{len(reqs)} {vals}")
+    check("no page errors", not errs, "; ".join(errs))
+    await ctx.close()
+
+    # Open-Meteo out of reach: the automatic fetch says so and opens the paste box, and nothing breaks
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda r: r.abort())
+    await pg.set_input_files("#file", {"name": "coast.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.set_input_files("#gps", {"name": "coast.gpx", "mimeType": "application/gpx+xml", "buffer": synth_track(t, v, grade=-0.004).encode()})
+    await pg.wait_for_timeout(1500)
+    st = await pg.evaluate("({m: $('#wxmsg').className, open: $('#wxman').open, b: $('#wxget').disabled})")
+    check("with Open-Meteo out of reach the automatic fetch shows an error, opens Enter Weather by Hand and leaves the button on",
+          "err" in st["m"] and st["open"] and not st["b"], str(st))
     check("no page errors", not errs, "; ".join(errs))
     await ctx.close()
 
@@ -733,6 +778,7 @@ async def main():
         await boost_tile(browser)
         await coast_fit(browser)
         await field_tags(browser)
+        await auto_weather(browser)
         await weather_pressure_temp(browser)
         if LOG:
             await with_log(browser)
