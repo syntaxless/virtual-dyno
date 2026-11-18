@@ -201,6 +201,10 @@ https://dyno.turboloser.co (GitHub Pages, served from `main`). The repo is publi
   altitude with `station()` (shared with `applyWx`). Fetch weather again still replaces it with a lookup. `parseGPS()` reads the app's
   `<dl:relalt>` (barometric altitude change, m, any namespace prefix) as `ra`; `elev()` takes the grade from it when every point in the
   window has one (`baro:true`), and `coastFit()` then counts 0.4 m of drift instead of 1.5 m. `functional.py`'s `logger_columns` checks it.
+- **Logger vehicle profile** (logger 1.1). `parse()` also reads `Curb Weight (lbs)` (already less the fuel not in the tank),
+  `Driver + Cargo (lbs)`, `Drag Coefficient` and `Frontal Area (m2)` into `D.veh` (column means, dropped when out of a believable
+  range), and `load()` fills those fields with the `log` tag unless they were typed, and names them in the log message.
+  `functional.py`'s `vehicle_profile` checks it.
 - **Density altitude inputs.** The air density comes from the `da`, `temp` and `humid` fields (DA is filled in
   automatically until the user types in it). Its pressure comes from, in order: the log's "Ambient Pressure" column
   (`atm.baro`, a measurement, so it always wins), then the weather answer's sea-level pressure (`pressure_msl`)

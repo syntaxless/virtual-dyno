@@ -311,6 +311,8 @@ function parse(text){
   let pi=f(/pedal/i);if(pi<0)pi=f(/throttle/i,/target|desired/i);
   const ai=f(/ambient/i,/press|baro/i),phi=f(/^phone pressure/i);let bi=f(/ambient.*press|baro/i);
   // Columns the Dyno Logger app adds: Open-Meteo's weather where the phone was at the run (one value per row, nearest snapshot)
+  // and the vehicle profile typed in the app (Curb Weight is already less the fuel that was not in the tank)
+  const vc={curb:f(/^curb weight/i),load:f(/^driver \+ cargo/i),cd:f(/^drag coefficient/i),area:f(/^frontal area/i)},vv={curb:[],load:[],cd:[],area:[]};
   const wc={rh:f(/^weather humidity/i),ws:f(/^weather wind \(/i),wd:f(/^weather wind from/i),tF:f(/^weather air temp/i),msl:f(/^weather sea-level pressure/i)},wv={rh:[],ws:[],wd:[],tF:[],msl:[]},ph=[];
   let oi=f(/boost/i,/trgt|target|set ?p|desired|request|duty|wastegate|solenoid|control/i);if(oi<0)oi=f(/rel.*manifold|manifold.*rel/i,/trgt|target|set ?p|desired/i);
   const bu=/kpa/i.test(H[oi]||'')?1/6.89476:/mbar|hpa/i.test(H[oi]||'')?1/68.9476:/\bbar\b/i.test(H[oi]||'')?14.5038:/inhg/i.test(H[oi]||'')?.491154:1;
@@ -323,6 +325,7 @@ function parse(text){
     if(bi>=0&&!isNaN(c[bi]))bm.push(c[bi]);
     if(phi>=0&&!isNaN(c[phi]))ph.push(c[phi]);
     for(const k in wc)if(wc[k]>=0&&!isNaN(c[wc[k]]))wv[k].push(c[wc[k]]);
+    for(const k in vc)if(vc[k]>=0&&!isNaN(c[vc[k]]))vv[k].push(c[vc[k]]);
     bo.push(oi>=0&&!isNaN(c[oi])?c[oi]*bu:NaN);t.push(c[ti]);rpm.push(c[ri]);v.push(c[si]*su);ped.push(pi>=0&&!isNaN(c[pi])?c[pi]:null)}
   if(t.length<30)throw Error('Only '+t.length+' usable rows found. The log is too short to analyze.');
   let ts=/ms|milli/i.test(H[ti])?.001:1;if(ts==1&&(t[t.length-1]-t[0])/t.length>5)ts=.001;
@@ -340,7 +343,9 @@ function parse(text){
       wx.ws=Math.hypot(u,w)/n;wx.wd=(Math.atan2(u,w)*180/Math.PI+360)%360}
     if(wx.rh!=null&&!(wx.rh>=0&&wx.rh<=100))wx.rh=null;if(wx.tF!=null&&!(wx.tF>-40&&wx.tF<150))wx.tF=null;if(wx.msl!=null&&!(wx.msl>870&&wx.msl<1090))wx.msl=null}
   const hasB=oi>=0&&bo.some(isFinite);
-  return{t,rpm,v,ped:pi>=0?ped:null,boost:hasB?bo:null,n:t.length,amb,baro,wx,info:`Using “${H[ri]}”, “${H[si]}”, ${pi>=0?'“'+H[pi]+'”':'no pedal column (pulls found from RPM and speed only)'}.${hasB?` Boost from “${H[oi]}”.`:''}${an}`}}
+    const VR={curb:[500,15000],load:[0,3000],cd:[.1,1.5],area:[.5,8]},veh={};
+  for(const k in vc){const a=avg(vv[k]);if(a!=null&&a>=VR[k][0]&&a<=VR[k][1])veh[k]=a}
+  return{t,rpm,v,ped:pi>=0?ped:null,boost:hasB?bo:null,n:t.length,amb,baro,wx,veh,info:`Using “${H[ri]}”, “${H[si]}”, ${pi>=0?'“'+H[pi]+'”':'no pedal column (pulls found from RPM and speed only)'}.${hasB?` Boost from “${H[oi]}”.`:''}${an}`}}
 
 /* Coast-down: Rolling Resistance from a slow-down with the pedal off and the clutch in. Then nothing but the road and the air acts on the car:
      (m+mw) dv/dt = -( 0.5 rho Cd A (v+wind)|v+wind| + Crr m g + m g sin(grade) )
@@ -588,7 +593,10 @@ function syncDA(){if(!daAuto)return;const d=calcDA();if(d!=null){$('#da').value=
 
 function load(text,name,fname){   // fname: what Print names its file after, when it is not the name shown in the message
   const M=$('#msg');fresh=true;wxReq++;$('#wxmsg').textContent='';
-  try{D=parse(text);logName=fname||name;M.className='msg';M.textContent=`${name}: ${D.n.toLocaleString()} rows. ${D.info}`;clearSrc();crrAuto=true;if(D.amb!=null){$('#temp').value=D.amb;src('temp','log')}atm.baro=D.baro||0;atm.wp=0;daAuto=true;syncDA();if(atm.baro)M.textContent+=` Density altitude set to ${$('#da').value} ft from the log's pressure and temperature.`;analyze(true);if(!gi)logWx()}
+  try{D=parse(text);logName=fname||name;M.className='msg';M.textContent=`${name}: ${D.n.toLocaleString()} rows. ${D.info}`;clearSrc();crrAuto=true;if(D.amb!=null){$('#temp').value=D.amb;src('temp','log')}
+    // the vehicle profile from the Dyno Logger app, unless the field was typed here
+    const vs=[];for(const[k,x]of Object.entries(D.veh))if(srcOf(k)!='typed'){const dec=k=='cd'?3:k=='area'?2:0;$('#'+k).value=+x.toFixed(dec);src(k,'log');vs.push(fieldLabel(k).firstChild.textContent.replace(/ \(.*/,'')+' '+(+x.toFixed(dec)).toLocaleString())}
+    if(vs.length)M.textContent+=` From the logger app's vehicle profile: ${vs.join(', ')}.`;atm.baro=D.baro||0;atm.wp=0;daAuto=true;syncDA();if(atm.baro)M.textContent+=` Density altitude set to ${$('#da').value} ft from the log's pressure and temperature.`;analyze(true);if(!gi)logWx()}
   catch(e){D=null;logName='';pulls=[];M.className='msg err';M.textContent=e.message;render();wxVis()}}
 
 function demo(){

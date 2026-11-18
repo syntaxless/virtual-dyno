@@ -834,6 +834,46 @@ async def logger_columns(browser):
     await ctx.close()
 
 
+async def vehicle_profile(browser):
+    """The logger app's vehicle profile columns fill Curb Weight, Driver + Cargo, Drag Coefficient and Frontal Area (tag log), keep
+    typed fields, ignore values out of range, and change the numbers like typing them would."""
+    txt, t, v = synth_coast(crr=0.0105)
+    prof = with_cols(txt, [("Fuel Level (%)", lambda r: 50), ("Curb Weight (lbs)", lambda r: 3456), ("Driver + Cargo (lbs)", lambda r: 180),
+                           ("Drag Coefficient", lambda r: 0.31), ("Frontal Area (m2)", lambda r: 2.25)])
+    ctx, pg, errs = await open_page(browser, expand=True)
+    await pg.route("**/*open-meteo.com/**", lambda rt: rt.abort())
+    vals = lambda: pg.evaluate("Object.fromEntries(['curb','load','cd','area'].map(id => [id, [document.getElementById(id).value, srcOf(id)]]))")
+    await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(2700)
+    plain = await nums(pg)
+    await pg.set_input_files("#file", {"name": "prof.csv", "mimeType": "text/csv", "buffer": prof.encode()})
+    await pg.wait_for_timeout(2700)
+    f, msg, got = await vals(), await pg.inner_text("#msg"), await nums(pg)
+    check("the profile columns fill the four fields with a log tag", f == {"curb": ["3456", "log"], "load": ["180", "log"], "cd": ["0.31", "log"], "area": ["2.25", "log"]}, str(f))
+    check("the log message names the profile values", "vehicle profile" in msg and "Curb Weight 3,456" in msg, msg[-160:])
+    await pg.set_input_files("#file", {"name": "plain.csv", "mimeType": "text/csv", "buffer": txt.encode()})
+    await pg.wait_for_timeout(300)
+    for k, x in (("curb", "3456"), ("load", "180"), ("cd", "0.31"), ("area", "2.25")):
+        await pg.fill("#" + k, x)
+    await pg.wait_for_timeout(2700)
+    typed = await nums(pg)
+    check("profile values give the same numbers as typing them", got == typed and got != plain, f"{plain} {got} {typed}")
+    await pg.fill("#curb", "3000")
+    await pg.set_input_files("#file", {"name": "prof.csv", "mimeType": "text/csv", "buffer": prof.encode()})
+    await pg.wait_for_timeout(600)
+    f = await vals()
+    check("a typed field is kept over the profile", f["curb"] == ["3000", "typed"], str(f))
+    await ctx.close()
+    ctx, pg, errs2 = await open_page(browser, expand=True)
+    bad = with_cols(txt, [("Curb Weight (lbs)", lambda r: 33000), ("Drag Coefficient", lambda r: 32)])
+    await pg.set_input_files("#file", {"name": "bad.csv", "mimeType": "text/csv", "buffer": bad.encode()})
+    await pg.wait_for_timeout(600)
+    f = await vals()
+    check("profile values out of range are ignored", f["curb"] == ["3300", ""] and f["cd"] == ["0.32", ""], str(f))
+    check("no page errors", not errs and not errs2, "; ".join(errs + errs2))
+    await ctx.close()
+
+
 async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
@@ -846,6 +886,7 @@ async def main():
         await field_tags(browser)
         await auto_weather(browser)
         await logger_columns(browser)
+        await vehicle_profile(browser)
         await weather_pressure_temp(browser)
         if LOG:
             await with_log(browser)
