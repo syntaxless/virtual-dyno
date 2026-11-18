@@ -278,6 +278,12 @@ input[type=range]::-moz-range-thumb{width:12px;height:20px;background:var(--fg);
 </main>
 <script>
 
+/* GoatCounter counts (no third-party script, no cookies, no personal data): one image request per page view, and a named
+   event (log-loaded, gps-loaded, demo, print) when a visitor uses the dyno. Only on the live domain and not under automation. */
+function count(p,ev){if(location.hostname!=='dyno.turboloser.co'||navigator.webdriver)return;
+  try{const q=new URLSearchParams({p,rnd:Math.random().toString(36).slice(2)});
+    if(ev)q.set('e','true');else{q.set('t',document.title);q.set('r',document.referrer);q.set('s',screen.width)}
+    new Image().src='https://dyno.goatcounter.com/count?'+q}catch{/* no count */}}
 const $=s=>document.querySelector(s),G=9.80665,LB=.45359237,MPH=.44704,HP=745.69987,LBFT=.737562;
 const FIELDS=[['curb','Curb Weight (lbs)',3300,10],['load','Driver + Cargo (lbs)',200,10],['cd','Drag Coefficient',.32,.01],['area','Frontal Area (m²)',2.2,.05],['crr','Rolling Resistance',.012,.001],['loss','Drivetrain Loss (%)',20,.5],['temp','Air Temp (°F)',70,1],['da','Density Altitude (ft)',0,100],['humid','Humidity (%)',25,5],['ped','Throttle Position >= (%)',90,1],['wind','Wind Speed (MPH)',0,1],['wdir','Wind From (° Compass)',0,10],['head','Car Heading (°)',0,1],['grade','Road Grade (%)',0,.1],['rpmpm','RPM per MPH (GPS Only)',0,.1]];
 $('#fields').innerHTML=FIELDS.map(([id,l,v,st])=>`<label class="f">${l}<input type="number" id="${id}" value="${v}" step="${st}"></label>`).join('');
@@ -657,7 +663,7 @@ function gpsOnly(){
   $('#msg').className='msg';$('#msg').textContent='GPS only: power is plotted against speed. Enter RPM per MPH for your gear (under Car & Conditions) to get RPM and torque.';analyze(true)}
 const readGPS=f=>f&&f.text().then(tx=>{const M=$('#gmsg');
   try{GPS=parseGPS(tx);gpsName=f.name;fresh=true;M.className='msg';M.textContent=`${f.name}: ${GPS.length} GPS points at about ${Math.round(GPS.hz)} Hz.`;
-    if(!D||D.gpsOnly)gpsOnly();else if(pulls.length)fromGPS(1)}
+    if(!D||D.gpsOnly)gpsOnly();else if(pulls.length)fromGPS(1);count('gps-loaded',1)}
   catch(er){GPS=null;gpsName='';gi=null;M.className='msg err';M.textContent=er.message}});
 $('#gps').onchange=e=>{const f=e.target.files[0];e.target.value='';readGPS(f)};
 const gz=$('#gdrop');gz.ondragover=e=>{e.preventDefault();gz.classList.add('on')};gz.ondragleave=()=>gz.classList.remove('on');
@@ -756,7 +762,7 @@ async function snap(){
       name=(stem?stem+'_':'')+'VirtualDyno.jpg',blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.9));
     if(!blob)throw new Error('no image');
     const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;document.body.append(a);a.click();a.remove();
-    setTimeout(()=>URL.revokeObjectURL(u),6e4);note('Saved '+name)}
+    setTimeout(()=>URL.revokeObjectURL(u),6e4);note('Saved '+name);count('print',1)}
   catch{note('Could not make the image')}}
 $('#print').onclick=snap;
 /* The banner is sized for VT323 (0.4em per character). If the font did not load, a wider fallback would overflow it,
@@ -844,11 +850,11 @@ $('#wxgeo').onclick=()=>{const M=$('#wxmsg'),bad=t=>{M.className='msg err';M.tex
 ['#wxplace','#wxdate','#wxtime'].forEach(q=>$(q).onkeydown=e=>{if(e.key==='Enter')$('#wxpget').click()});
 $('#wxdate').min='1940-01-01';$('#wxdate').max=new Date(Date.now()+15*864e5).toISOString().slice(0,10);
 const fi=$('#file'),dz=$('#drop');
-const read=f=>f&&f.text().then(tx=>load(tx,f.name));
+const read=f=>f&&f.text().then(tx=>{load(tx,f.name);if(D)count('log-loaded',1)});
 fi.onchange=()=>{const f=fi.files[0];fi.value='';read(f)};
 dz.ondragover=e=>{e.preventDefault();dz.classList.add('on')};dz.ondragleave=()=>dz.classList.remove('on');
 dz.ondrop=e=>{e.preventDefault();dz.classList.remove('on');read(e.dataTransfer.files[0])};
-$('#demo').onclick=demo;$('#pull').onchange=e=>{sel=+e.target.value;fresh=true;GPS?fromGPS():render()};
+$('#demo').onclick=()=>{demo();count('demo',1)};$('#pull').onchange=e=>{sel=+e.target.value;fresh=true;GPS?fromGPS():render()};
 document.querySelectorAll('#fields input,#smooth,#corr,#spd').forEach(el=>el.addEventListener('input',()=>{if(el.id=='head')headSet=true;if(el.id=='da')daAuto=false;else if(el.id=='temp'||el.id=='humid')syncDA();if(el.id=='crr')crrAuto=false;src(el.id,'typed');analyze(false)}));
 addEventListener('resize',draw);
 const RB=(()=>{
@@ -935,8 +941,7 @@ const P0=document.documentElement.dataset.phosphor;setPhos(['green','color'].inc
 for(const [b,p] of [['condtg','condbody'],['howtg','howbody']])$('#'+b).onclick=function(){const o=this.getAttribute('aria-expanded')==='true';this.setAttribute('aria-expanded',String(!o));$('#'+p).hidden=o;this.closest('fieldset').classList.toggle('shut',o)};
 {const d=document.documentElement;if(d.classList.contains('bt')){const end=()=>{d.classList.remove('bt');removeEventListener('pointerdown',end);removeEventListener('keydown',end)};addEventListener('pointerdown',end);addEventListener('keydown',end);setTimeout(end,2300)}}
 render();
-// GoatCounter visit count: one image request to goatcounter.com, on the live domain only (no third-party script)
-if(location.hostname==='dyno.turboloser.co'&&!navigator.webdriver)try{new Image().src='https://dyno.goatcounter.com/count?p='+encodeURIComponent(location.pathname)+'&t='+encodeURIComponent(document.title)+'&r='+encodeURIComponent(document.referrer)+'&s='+screen.width+'&rnd='+Math.random().toString(36).slice(2)}catch{/* no count */}
+count(location.pathname);
 // Installable and usable with no signal: sw.js keeps a copy of the page. Service workers need http(s), so a file:// copy skips this.
 if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol))addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
 </script></body></html>
